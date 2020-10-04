@@ -19,7 +19,7 @@ setup(
   install_requires=[
       'contrastive_learner>=0.1.0',
       'fire',
-      'kornia',
+      'kornia==0.2.2',
       'linear_attention_transformer',
       'numpy',
       'retry',

@@ -444,13 +444,13 @@ class EqualLinear(nn.Module):
 class StyleVectorizer(nn.Module):
     def __init__(self, emb, depth, n_labels, lr_mul=0.1):
         super().__init__()
-        self.embed = nn.Embedding(n_labels, emb)
 
         layers = []
         for i in range(depth):
             layers.extend([EqualLinear(emb, emb, lr_mul), leaky_relu()])
 
         self.net = nn.Sequential(*layers)
+        self.embed = nn.Embedding(n_labels, emb)
 
     def forward(self, x, index):
         offset = self.embed(index)
@@ -692,8 +692,8 @@ class Discriminator(nn.Module):
     def __init__(
         self,
         image_size,
-        n_labels,
         network_capacity=16,
+        n_labels=62,
         fq_layers=[],
         fq_dict_size=256,
         attn_layers=[],
@@ -705,7 +705,6 @@ class Discriminator(nn.Module):
         num_init_filters = 3 if not transparent else 4
         self.num_init_filters = num_init_filters
         self.n_labels = n_labels
-        self.embeds = nn.Embedding(n_labels, image_noise * num_init_filters)
 
         blocks = []
         filters = [num_init_filters] + [(64) * (2 ** i) for i in range(num_layers + 1)]
@@ -746,6 +745,7 @@ class Discriminator(nn.Module):
         self.final_conv = nn.Conv2d(chan_last, chan_last, 3, padding=1)
         self.flatten = Flatten()
         self.to_logit = nn.Linear(latent_dim, 1)
+        self.embeds = nn.Embedding(n_labels, image_size * (num_init_filters - 1))
 
     def forward(self, img, index):
         b, n_channels, n_x, n_y = img.shape
@@ -804,7 +804,7 @@ class StyleGAN2(nn.Module):
         self.steps = steps
         self.ema_updater = EMA(0.995)
 
-        self.S = StyleVectorizer(latent_dim, style_depth, n_labels, lr_mul=lr_mlp)
+        self.S = StyleVectorizer(latent_dim, style_depth, n_labels=n_labels, lr_mul=lr_mlp)
         self.G = Generator(
             image_size,
             latent_dim,
@@ -817,7 +817,7 @@ class StyleGAN2(nn.Module):
         self.D = Discriminator(
             image_size,
             network_capacity,
-            n_labels,
+            n_labels=n_labels,
             fq_layers=fq_layers,
             fq_dict_size=fq_dict_size,
             attn_layers=attn_layers,
@@ -825,7 +825,7 @@ class StyleGAN2(nn.Module):
             fmap_max=fmap_max,
         )
 
-        self.SE = StyleVectorizer(latent_dim, style_depth, n_labels, lr_mul=lr_mlp)
+        self.SE = StyleVectorizer(latent_dim, style_depth, n_labels=n_labels, lr_mul=lr_mlp)
         self.GE = Generator(
             image_size,
             latent_dim,
@@ -1599,6 +1599,7 @@ class Trainer:
             load_data = {"GAN": load_data}
 
         missing, unexpected = self.GAN.load_state_dict(load_data["GAN"], strict=False)
+        
 
         if self.GAN.fp16 and "amp" in load_data:
             missing, unexpected = amp.load_state_dict(load_data["amp"], strict=False)
