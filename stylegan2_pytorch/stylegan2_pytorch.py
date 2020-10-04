@@ -395,6 +395,7 @@ class Dataset(data.Dataset):
         path = self.paths[index]
         # Get filename, without extension, then last split has label index
         label = path.split("/")[-1].split(".")[0].split("_")[-1]
+        label = torch.tensor(label)
         img = Image.open(path)
         return self.transform(img), label
 
@@ -780,6 +781,7 @@ class StyleGAN2(nn.Module):
     def __init__(
         self,
         image_size,
+        n_labels,
         latent_dim=512,
         fmap_max=512,
         style_depth=8,
@@ -914,6 +916,7 @@ class Trainer:
         results_dir,
         models_dir,
         image_size,
+        n_labels,
         network_capacity,
         transparent=False,
         batch_size=4,
@@ -942,7 +945,6 @@ class Trainer:
         is_ddp=False,
         rank=0,
         world_size=1,
-        n_labels=62,
         *args,
         **kwargs,
     ):
@@ -958,6 +960,7 @@ class Trainer:
             image_size
         ).is_integer(), "image size must be a power of 2 (64, 128, 256, 512, 1024)"
         self.image_size = image_size
+        self.n_labels = n_labels
         self.network_capacity = network_capacity
         self.transparent = transparent
 
@@ -1038,6 +1041,7 @@ class Trainer:
             lr_mlp=self.lr_mlp,
             ttur_mult=self.ttur_mult,
             image_size=self.image_size,
+            n_labels=self.n_labels,
             network_capacity=self.network_capacity,
             transparent=self.transparent,
             fq_layers=self.fq_layers,
@@ -1170,7 +1174,7 @@ class Trainer:
                 image, label = next(self.loader)
                 image, label = image.cuda(self.rank), label.cuda(self.rank)
                 # image_batch = next(self.loader).cuda(self.rank)
-                self.GAN.D_cl(image_batch, label, accumulate=True)
+                self.GAN.D_cl(image, label, accumulate=True)
 
             loss = self.GAN.D_cl.calculate_loss()
             self.last_cr_loss = loss.clone().detach().item()
@@ -1199,9 +1203,12 @@ class Trainer:
                 generated_images.clone().detach(), detach=True, **aug_kwargs
             )
 
-            image_batch = next(self.loader).cuda(self.rank)
-            image_batch.requires_grad_()
-            real_output, real_q_loss = D_aug(image_batch, **aug_kwargs)
+            image, labls = next(self.loader)
+            image = image.cuda(self.rank)
+            labls = labls.cuda(self.rank)
+            image.requires_grad_()
+            labls.requires_grad_()
+            real_output, real_q_loss = D_aug(image, labls, **aug_kwargs)
 
             real_output_loss = real_output
             fake_output_loss = fake_output
@@ -1591,8 +1598,10 @@ class Trainer:
         if "GAN" not in load_data:
             load_data = {"GAN": load_data}
 
-        self.GAN.load_state_dict(load_data["GAN"])
+        missing, unexpected = self.GAN.load_state_dict(load_data["GAN"], strict=False)
 
         if self.GAN.fp16 and "amp" in load_data:
-            amp.load_state_dict(load_data["amp"])
+            missing, unexpected = amp.load_state_dict(load_data["amp"], strict=False)
 
+        print("Missing keys: ", missing)
+        print("Unexpected keys: ", unexpected)
