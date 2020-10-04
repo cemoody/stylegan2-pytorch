@@ -266,8 +266,8 @@ def mixed_list(n, layers, latent_dim, device):
     )
 
 
-def latent_to_w(style_vectorizer, latent_descr):
-    return [(style_vectorizer(z), num_layers) for z, num_layers in latent_descr]
+def latent_to_w(style_vectorizer, latent_descr, labls):
+    return [(style_vectorizer(z, labls), num_layers) for z, num_layers in latent_descr]
 
 
 def image_noise(n, im_size, device):
@@ -335,6 +335,9 @@ class expand_greyscale(object):
         alpha = None
         if channels == 1:
             color = tensor.expand(3, -1, -1)
+            # We only write the grey into the first color channel,
+            # which is probably RGB, probably Red
+            color[1:, :, :] = 0.0
         elif channels == 2:
             color = tensor[:1].expand(3, -1, -1)
             alpha = tensor[1:]
@@ -390,8 +393,10 @@ class Dataset(data.Dataset):
 
     def __getitem__(self, index):
         path = self.paths[index]
+        # Get filename, without extension, then last split has label index
+        label = path.split("/")[-1].split(".")[0].split("_")[-1]
         img = Image.open(path)
-        return self.transform(img)
+        return self.transform(img), label
 
 
 # augmentations
@@ -436,8 +441,9 @@ class EqualLinear(nn.Module):
 
 
 class StyleVectorizer(nn.Module):
-    def __init__(self, emb, depth, lr_mul=0.1):
+    def __init__(self, emb, depth, n_labels, lr_mul=0.1):
         super().__init__()
+        self.embed = nn.Embedding(n_labels, emb)
 
         layers = []
         for i in range(depth):
@@ -445,8 +451,9 @@ class StyleVectorizer(nn.Module):
 
         self.net = nn.Sequential(*layers)
 
-    def forward(self, x):
-        x = F.normalize(x, dim=1)
+    def forward(self, x, index):
+        offset = self.embed(index)
+        x = F.normalize(x, dim=1) + offset
         return self.net(x)
 
 
@@ -684,6 +691,7 @@ class Discriminator(nn.Module):
     def __init__(
         self,
         image_size,
+        n_labels,
         network_capacity=16,
         fq_layers=[],
         fq_dict_size=256,
@@ -694,6 +702,9 @@ class Discriminator(nn.Module):
         super().__init__()
         num_layers = int(log2(image_size) - 1)
         num_init_filters = 3 if not transparent else 4
+        self.num_init_filters = num_init_filters
+        self.n_labels = n_labels
+        self.embeds = nn.Embedding(n_labels, image_noise * num_init_filters)
 
         blocks = []
         filters = [num_init_filters] + [(64) * (2 ** i) for i in range(num_layers + 1)]
@@ -735,10 +746,17 @@ class Discriminator(nn.Module):
         self.flatten = Flatten()
         self.to_logit = nn.Linear(latent_dim, 1)
 
-    def forward(self, x):
-        b, *_ = x.shape
+    def forward(self, img, index):
+        b, n_channels, n_x, n_y = img.shape
+        # extract just first channel, re-expand to original size
+        red = img[:, 0, ...][:, None, ...]
 
         quantize_loss = torch.zeros(1).to(x)
+        embed = self.embeds(index)
+        # produce blue-green channels from embedding
+        green_blue = embed.reshape(b, image_size, self.num_init_filters - 1)
+        # concatenate along the channel dimension
+        x = torch.cat((red, green_blue), dim=1)
 
         for (block, attn_block, q_block) in zip(
             self.blocks, self.attn_blocks, self.quantize_blocks
@@ -784,7 +802,7 @@ class StyleGAN2(nn.Module):
         self.steps = steps
         self.ema_updater = EMA(0.995)
 
-        self.S = StyleVectorizer(latent_dim, style_depth, lr_mul=lr_mlp)
+        self.S = StyleVectorizer(latent_dim, style_depth, n_labels, lr_mul=lr_mlp)
         self.G = Generator(
             image_size,
             latent_dim,
@@ -797,6 +815,7 @@ class StyleGAN2(nn.Module):
         self.D = Discriminator(
             image_size,
             network_capacity,
+            n_labels,
             fq_layers=fq_layers,
             fq_dict_size=fq_dict_size,
             attn_layers=attn_layers,
@@ -804,7 +823,7 @@ class StyleGAN2(nn.Module):
             fmap_max=fmap_max,
         )
 
-        self.SE = StyleVectorizer(latent_dim, style_depth, lr_mul=lr_mlp)
+        self.SE = StyleVectorizer(latent_dim, style_depth, n_labels, lr_mul=lr_mlp)
         self.GE = Generator(
             image_size,
             latent_dim,
@@ -846,9 +865,9 @@ class StyleGAN2(nn.Module):
         # startup apex mixed precision
         self.fp16 = fp16
         if fp16:
-            (self.S, self.G, self.D, self.SE, self.GE), (
-                self.G_opt,
-                self.D_opt,
+            (
+                (self.S, self.G, self.D, self.SE, self.GE),
+                (self.G_opt, self.D_opt),
             ) = amp.initialize(
                 [self.S, self.G, self.D, self.SE, self.GE],
                 [self.G_opt, self.D_opt],
@@ -923,6 +942,7 @@ class Trainer:
         is_ddp=False,
         rank=0,
         world_size=1,
+        n_labels=62,
         *args,
         **kwargs,
     ):
@@ -1147,8 +1167,10 @@ class Trainer:
                     self.GAN.D_cl(generated_images.clone().detach(), accumulate=True)
 
             for i in range(self.gradient_accumulate_every):
-                image_batch = next(self.loader).cuda(self.rank)
-                self.GAN.D_cl(image_batch, accumulate=True)
+                image, label = next(self.loader)
+                image, label = image.cuda(self.rank), label.cuda(self.rank)
+                # image_batch = next(self.loader).cuda(self.rank)
+                self.GAN.D_cl(image_batch, label, accumulate=True)
 
             loss = self.GAN.D_cl.calculate_loss()
             self.last_cr_loss = loss.clone().detach().item()
@@ -1165,10 +1187,11 @@ class Trainer:
             self.gradient_accumulate_every, self.is_ddp, ddps=[D_aug, S, G]
         ):
             get_latents_fn = mixed_list if random() < self.mixed_prob else noise_list
+            labls = torch.randint(0, self.n_labels, batch_size).cuda(self.rank)
             style = get_latents_fn(batch_size, num_layers, latent_dim, device=self.rank)
             noise = image_noise(batch_size, image_size, device=self.rank)
 
-            w_space = latent_to_w(S, style)
+            w_space = latent_to_w(S, style, labls)
             w_styles = styles_def_to_tensor(w_space)
 
             generated_images = G(w_styles, noise)
@@ -1572,3 +1595,4 @@ class Trainer:
 
         if self.GAN.fp16 and "amp" in load_data:
             amp.load_state_dict(load_data["amp"])
+
