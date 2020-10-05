@@ -1176,7 +1176,6 @@ class Trainer:
                     self.GAN.D_cl(generated_images.clone().detach(), accumulate=True)
 
             for i in range(self.gradient_accumulate_every):
-                import pdb; pdb.set_trace()
                 image, label = next(self.loader)
                 image, label = image.cuda(self.rank), label.cuda(self.rank)
                 # image_batch = next(self.loader).cuda(self.rank)
@@ -1365,10 +1364,10 @@ class Trainer:
         # latents and noise
 
         labls = torch.randint(0, self.n_labels, (num_rows,))
-        labls = labls.expand(num_rows, num_rows).cuda(self.rank)
+        labls = labls.expand(num_rows, num_rows)
+        labls = labls.reshape(num_rows ** 2).cuda(self.rank)
         latents = noise_list(num_rows ** 2, num_layers, latent_dim, device=self.rank)
         n = image_noise(num_rows ** 2, image_size, device=self.rank)
-        import pdb; pdb.set_trace()
 
         # regular
 
@@ -1486,8 +1485,8 @@ class Trainer:
 
         if not exists(self.av):
             z = noise(2000, latent_dim, device=self.rank)
-            import pdb; pdb.set_trace()
-            samples = evaluate_in_chunks(self.batch_size, S, z, labls).cpu().numpy()
+            t = torch.randint(0, self.n_labels, (2000,)).cuda(self.rank)
+            samples = evaluate_in_chunks(self.batch_size, S, z, t).cpu().numpy()
             self.av = np.mean(samples, axis=0)
             self.av = np.expand_dims(self.av, axis=0)
 
