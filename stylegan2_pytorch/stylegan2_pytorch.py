@@ -334,10 +334,13 @@ class expand_greyscale(object):
 
         alpha = None
         if channels == 1:
-            color = tensor.expand(3, -1, -1)
             # We only write the grey into the first color channel,
             # which is probably RGB, probably Red
-            color[1:, :, :] = 0.0
+            red = tensor
+            blue = torch.zeros_like(red)
+            green = torch.zeros_like(red)
+            color = torch.cat((red, blue, green))
+            # color = tensor.expand(3, -1, -1)
         elif channels == 2:
             color = tensor[:1].expand(3, -1, -1)
             alpha = tensor[1:]
@@ -394,7 +397,7 @@ class Dataset(data.Dataset):
     def __getitem__(self, index):
         path = self.paths[index]
         # Get filename, without extension, then last split has label index
-        label = path.split("/")[-1].split(".")[0].split("_")[-1]
+        label = int(path.stem.split('_')[-1])
         label = torch.tensor(label)
         img = Image.open(path)
         return self.transform(img), label
@@ -414,7 +417,7 @@ class AugWrapper(nn.Module):
         super().__init__()
         self.D = D
 
-    def forward(self, images, prob=0.0, types=[], detach=False):
+    def forward(self, images, labls, prob=0.0, types=[], detach=False):
         if random() < prob:
             images = random_hflip(images, prob=0.5)
             images = DiffAugment(images, types=types)
@@ -422,7 +425,7 @@ class AugWrapper(nn.Module):
         if detach:
             images.detach_()
 
-        return self.D(images)
+        return self.D(images, labls)
 
 
 # stylegan2 classes
@@ -444,6 +447,7 @@ class EqualLinear(nn.Module):
 class StyleVectorizer(nn.Module):
     def __init__(self, emb, depth, n_labels, lr_mul=0.1):
         super().__init__()
+        self.n_labels = n_labels
 
         layers = []
         for i in range(depth):
@@ -453,7 +457,7 @@ class StyleVectorizer(nn.Module):
         self.embed = nn.Embedding(n_labels, emb)
 
     def forward(self, x, index):
-        offset = self.embed(index)
+        offset = self.embed(index) * 1e-3
         x = F.normalize(x, dim=1) + offset
         return self.net(x)
 
@@ -745,19 +749,19 @@ class Discriminator(nn.Module):
         self.final_conv = nn.Conv2d(chan_last, chan_last, 3, padding=1)
         self.flatten = Flatten()
         self.to_logit = nn.Linear(latent_dim, 1)
-        self.embeds = nn.Embedding(n_labels, image_size * (num_init_filters - 1))
+        self.embeds = nn.Embedding(n_labels, image_size * image_size * (num_init_filters - 1))
 
     def forward(self, img, index):
         b, n_channels, n_x, n_y = img.shape
         # extract just first channel, re-expand to original size
         red = img[:, 0, ...][:, None, ...]
 
-        quantize_loss = torch.zeros(1).to(x)
         embed = self.embeds(index)
         # produce blue-green channels from embedding
-        green_blue = embed.reshape(b, image_size, self.num_init_filters - 1)
+        green_blue = embed.reshape(b, self.num_init_filters - 1, n_x, n_y)
         # concatenate along the channel dimension
         x = torch.cat((red, green_blue), dim=1)
+        quantize_loss = torch.zeros(1).to(x)
 
         for (block, attn_block, q_block) in zip(
             self.blocks, self.attn_blocks, self.quantize_blocks
@@ -1162,15 +1166,17 @@ class Trainer:
                     style = get_latents_fn(
                         batch_size, num_layers, latent_dim, device=self.rank
                     )
+                    labls = torch.randint(0, self.n_labels, (batch_size,)).cuda(self.rank)
                     noise = image_noise(batch_size, image_size, device=self.rank)
 
-                    w_space = latent_to_w(self.GAN.S, style)
+                    w_space = latent_to_w(self.GAN.S, style, labls)
                     w_styles = styles_def_to_tensor(w_space)
 
                     generated_images = self.GAN.G(w_styles, noise)
                     self.GAN.D_cl(generated_images.clone().detach(), accumulate=True)
 
             for i in range(self.gradient_accumulate_every):
+                import pdb; pdb.set_trace()
                 image, label = next(self.loader)
                 image, label = image.cuda(self.rank), label.cuda(self.rank)
                 # image_batch = next(self.loader).cuda(self.rank)
@@ -1191,7 +1197,8 @@ class Trainer:
             self.gradient_accumulate_every, self.is_ddp, ddps=[D_aug, S, G]
         ):
             get_latents_fn = mixed_list if random() < self.mixed_prob else noise_list
-            labls = torch.randint(0, self.n_labels, batch_size).cuda(self.rank)
+            # labls = torch.randint(0, self.n_labels, batch_size).cuda(self.rank)
+            labls = torch.randint(0, self.n_labels, (batch_size,)).cuda(self.rank)
             style = get_latents_fn(batch_size, num_layers, latent_dim, device=self.rank)
             noise = image_noise(batch_size, image_size, device=self.rank)
 
@@ -1200,14 +1207,15 @@ class Trainer:
 
             generated_images = G(w_styles, noise)
             fake_output, fake_q_loss = D_aug(
-                generated_images.clone().detach(), detach=True, **aug_kwargs
+                generated_images.clone().detach(), 
+                labls.clone().detach(), 
+                detach=True, **aug_kwargs
             )
 
             image, labls = next(self.loader)
             image = image.cuda(self.rank)
             labls = labls.cuda(self.rank)
             image.requires_grad_()
-            labls.requires_grad_()
             real_output, real_q_loss = D_aug(image, labls, **aug_kwargs)
 
             real_output_loss = real_output
@@ -1229,7 +1237,7 @@ class Trainer:
                 disc_loss = disc_loss + quantize_loss
 
             if apply_gradient_penalty:
-                gp = gradient_penalty(image_batch, real_output)
+                gp = gradient_penalty(image, real_output)
                 self.last_gp_loss = gp.clone().detach().item()
                 disc_loss = disc_loss + gp
 
@@ -1251,14 +1259,16 @@ class Trainer:
         for i in gradient_accumulate_contexts(
             self.gradient_accumulate_every, self.is_ddp, ddps=[S, G, D_aug]
         ):
+            labls = torch.randint(0, self.n_labels, (batch_size,)).cuda(self.rank)
             style = get_latents_fn(batch_size, num_layers, latent_dim, device=self.rank)
             noise = image_noise(batch_size, image_size, device=self.rank)
 
-            w_space = latent_to_w(S, style)
+
+            w_space = latent_to_w(S, style, labls)
             w_styles = styles_def_to_tensor(w_space)
 
             generated_images = G(w_styles, noise)
-            fake_output, _ = D_aug(generated_images, **aug_kwargs)
+            fake_output, _ = D_aug(generated_images, labls, **aug_kwargs)
             fake_output_loss = fake_output
 
             if self.top_k_training:
@@ -1343,7 +1353,7 @@ class Trainer:
         self.av = None
 
     @torch.no_grad()
-    def evaluate(self, num=0, num_image_tiles=8, trunc=1.0):
+    def evaluate(self, num=0, num_image_tiles=9, trunc=1.0):
         self.GAN.eval()
         ext = self.image_extension
         num_rows = num_image_tiles
@@ -1354,13 +1364,16 @@ class Trainer:
 
         # latents and noise
 
+        labls = torch.randint(0, self.n_labels, (num_rows,))
+        labls = labls.expand(num_rows, num_rows).cuda(self.rank)
         latents = noise_list(num_rows ** 2, num_layers, latent_dim, device=self.rank)
         n = image_noise(num_rows ** 2, image_size, device=self.rank)
+        import pdb; pdb.set_trace()
 
         # regular
 
         generated_images = self.generate_truncated(
-            self.GAN.S, self.GAN.G, latents, n, trunc_psi=self.trunc_psi
+            self.GAN.S, self.GAN.G, latents, labls, n, trunc_psi=self.trunc_psi
         )
         torchvision.utils.save_image(
             generated_images,
@@ -1371,7 +1384,7 @@ class Trainer:
         # moving averages
 
         generated_images = self.generate_truncated(
-            self.GAN.SE, self.GAN.GE, latents, n, trunc_psi=self.trunc_psi
+            self.GAN.SE, self.GAN.GE, latents, labls, n, trunc_psi=self.trunc_psi
         )
         torchvision.utils.save_image(
             generated_images,
@@ -1401,7 +1414,7 @@ class Trainer:
         mixed_latents = [(tmp1, tt), (tmp2, num_layers - tt)]
 
         generated_images = self.generate_truncated(
-            self.GAN.SE, self.GAN.GE, mixed_latents, n, trunc_psi=self.trunc_psi
+            self.GAN.SE, self.GAN.GE, mixed_latents, labls, n, trunc_psi=self.trunc_psi
         )
         torchvision.utils.save_image(
             generated_images,
@@ -1451,7 +1464,7 @@ class Trainer:
 
             # moving averages
             generated_images = self.generate_truncated(
-                self.GAN.SE, self.GAN.GE, latents, n, trunc_psi=self.trunc_psi
+                self.GAN.SE, self.GAN.GE, latents, labls, n, trunc_psi=self.trunc_psi
             )
 
             for j in range(generated_images.size(0)):
@@ -1468,18 +1481,19 @@ class Trainer:
         )
 
     @torch.no_grad()
-    def generate_truncated(self, S, G, style, noi, trunc_psi=0.75, num_image_tiles=8):
+    def generate_truncated(self, S, G, style, labls, noi, trunc_psi=0.75, num_image_tiles=8):
         latent_dim = G.latent_dim
 
         if not exists(self.av):
             z = noise(2000, latent_dim, device=self.rank)
-            samples = evaluate_in_chunks(self.batch_size, S, z).cpu().numpy()
+            import pdb; pdb.set_trace()
+            samples = evaluate_in_chunks(self.batch_size, S, z, labls).cpu().numpy()
             self.av = np.mean(samples, axis=0)
             self.av = np.expand_dims(self.av, axis=0)
 
         w_space = []
         for tensor, num_layers in style:
-            tmp = S(tensor)
+            tmp = S(tensor, labls)
             av_torch = torch.from_numpy(self.av).cuda(self.rank)
             tmp = trunc_psi * (tmp - av_torch) + av_torch
             w_space.append((tmp, num_layers))

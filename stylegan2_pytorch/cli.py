@@ -64,7 +64,8 @@ def run_training(
         mininterval=10.0,
         desc=f"{name}<{data}>",
     ):
-        retry_call(model.train, tries=3, exceptions=NanException)
+        # retry_call(model.train, tries=3, exceptions=NanException)
+        model.train()
         if is_main and _ % 50 == 0:
             model.print_log()
 
@@ -148,6 +149,7 @@ def train_from_folder(
         calculate_fid_every=calculate_fid_every,
         mixed_prob=mixed_prob,
     )
+
 
     if generate:
         model = Trainer(**model_args)
